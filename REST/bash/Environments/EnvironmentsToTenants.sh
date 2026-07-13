@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
 # Define working variables
 octopusUrl="https://tam.octopus.app"
@@ -8,12 +7,16 @@ spaceName="Applied"
 projectName="Parallel"
 
 # Provide target environment names; one tenant will be created per environment.
-environmentNames=("Dev-CA" "Dev-OR" "Dev-WA")
+environmentNames=("Prod-CA" "Prod-OR" "Prod-WA")
 
 # Optional tenant tags to apply to all generated tenants.
-tenantTags=("Env/Dev" "Region/Pacific")
+tenantTags=("Env/Prod" "Region/Pacific")
+
+# Tag color used when creating missing tags.
+tagColor="#007BFF"
 
 deleteEnvironments=false
+debugMode=false
 
 usage() {
   cat <<'EOF'
@@ -28,54 +31,120 @@ Options:
   -e environmentNames
                     Comma-separated list of environment names to create tenants for.
   -t tenantTags     Comma-separated list of tenant tags to apply to each created tenant.
-  -d deleteEnvironments
-                    Delete environments after successful tenant creation when set to true or 1.
+  -rm               Remove environments after successful tenant creation.
+  -d                Enable debug mode and print extra tracing information.
   -h                Show this help message and exit.
 EOF
 }
 
-while getopts ":u:s:p:e:t:d:h" opt; do
-  case "$opt" in
-    u) octopusUrl="$OPTARG" ;;
-    s) spaceName="$OPTARG" ;;
-    p) projectName="$OPTARG" ;;
-    e)
-      IFS=',' read -r -a environmentNames <<< "$OPTARG"
+debug() {
+  if [ "$debugMode" = true ]; then
+    printf 'DEBUG: %s\n' "$*" >&2
+  fi
+}
+
+curl_with_check() {
+  local method="$1"
+  local url="$2"
+  local data="$3"
+  shift 3
+  debug "curl $method $url"
+
+  local response
+  if [ -n "$data" ]; then
+    response=$(curl -sS -w "\n%{http_code}" -X "$method" -H "X-Octopus-ApiKey: $octopusApiKey" -H "Content-Type: application/json" "$url" -d "$data" "$@")
+  else
+    response=$(curl -sS -w "\n%{http_code}" -X "$method" -H "X-Octopus-ApiKey: $octopusApiKey" "$url" "$@")
+  fi
+
+  local http_code
+  http_code=$(printf '%s' "$response" | tail -n 1)
+  local body
+  body=$(printf '%s\n' "$response" | sed '$d')
+
+  if [ "$http_code" -ge 400 ]; then
+    echo "ERROR: $method $url returned HTTP $http_code" >&2
+    echo "$body" >&2
+    return 1
+  fi
+
+  printf '%s' "$body"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -u)
+      if [ $# -lt 2 ]; then
+        echo "Error: -u requires an argument." >&2
+        usage
+        exit 1
+      fi
+      shift
+      octopusUrl="$1"
       ;;
-    t)
-      IFS=',' read -r -a tenantTags <<< "$OPTARG"
+    -s)
+      if [ $# -lt 2 ]; then
+        echo "Error: -s requires an argument." >&2
+        usage
+        exit 1
+      fi
+      shift
+      spaceName="$1"
       ;;
-    d)
-      delete_value=$(printf '%s' "$OPTARG" | tr '[:upper:]' '[:lower:]')
-      case "$delete_value" in
-        true|1)
-          deleteEnvironments=true
-          ;;
-        false|0)
-          deleteEnvironments=false
-          ;;
-        *)
-          echo "Error: -d value must be true, false, 1, or 0." >&2
-          usage
-          exit 1
-          ;;
-      esac
+    -p)
+      if [ $# -lt 2 ]; then
+        echo "Error: -p requires an argument." >&2
+        usage
+        exit 1
+      fi
+      shift
+      projectName="$1"
       ;;
-    h)
+    -e)
+      if [ $# -lt 2 ]; then
+        echo "Error: -e requires an argument." >&2
+        usage
+        exit 1
+      fi
+      shift
+      IFS=',' read -r -a environmentNames <<< "$1"
+      ;;
+    -t)
+      if [ $# -lt 2 ]; then
+        echo "Error: -t requires an argument." >&2
+        usage
+        exit 1
+      fi
+      shift
+      IFS=',' read -r -a tenantTags <<< "$1"
+      ;;
+    -rm)
+      deleteEnvironments=true
+      ;;
+    -d)
+      debugMode=true
+      ;;
+    -h|--help)
       usage
       exit 0
       ;;
-    :) echo "Error: -$OPTARG requires an argument." >&2
-       usage
-       exit 1
-      ;;
-    \?) echo "Error: invalid option: -$OPTARG" >&2
-       usage
-       exit 1
+    *)
+      echo "Error: invalid option: $1" >&2
+      usage
+      exit 1
       ;;
   esac
-done
-shift $((OPTIND - 1))
+  shift
+ done
+
+if [ "$debugMode" = true ]; then
+  debug "octopusUrl=$octopusUrl"
+  debug "spaceName=$spaceName"
+  debug "projectName=$projectName"
+  debug "environmentNames=${environmentNames[*]}"
+  debug "tenantTags=${tenantTags[*]}"
+  debug "deleteEnvironments=$deleteEnvironments"
+fi
 
 # Utility: convert bash array to JSON array for jq.
 array_to_json() {
@@ -119,82 +188,58 @@ EOF
   return 1
 }
 
-ensure_tagset_tags() {
-  local tagsetName="$1"
-  local desiredTags=()
-  local fullTag
-  local tagName
-
-  for fullTag in "${tenantTags[@]}"; do
-    if [ "${fullTag%%/*}" = "$tagsetName" ]; then
-      tagName="${fullTag#*/}"
-      desiredTags+=("$tagName")
-    fi
-  done
+ensure_tagset_tag_exists() {
+  local fullTag="$1"
+  local tagsetName="${fullTag%%/*}"
+  local tagName="${fullTag#*/}"
 
   local encodedName
   encodedName=$(printf '%s' "$tagsetName" | jq -sRr @uri)
   local tagset_response
-  tagset_response=$(curl -s -H "X-Octopus-ApiKey: $octopusApiKey" "$octopusUrl/api/$space_id/tagsets?partialName=$encodedName")
+  tagset_response=$(curl_with_check GET "$octopusUrl/api/$space_id/tagsets?partialName=$encodedName" "")
   local tagset_id
   tagset_id=$(echo "$tagset_response" | jq -r --arg name "$tagsetName" '.Items[] | select(.Name==$name) | .Id' | head -n 1)
 
   if [ -z "$tagset_id" ] || [ "$tagset_id" = "null" ]; then
-    printf 'Creating tagset %s with tags: %s\n' "$tagsetName" "${desiredTags[*]}"
+    printf 'Creating tagset %s with tag %s\n' "$tagsetName" "$tagName"
     local tags_json
-    tags_json=$(printf '%s\n' "${desiredTags[@]}" | jq -R . | jq -s 'map({Id: null, Name: ., Color: "", Description: "", CanonicalTagName: null})')
+    tags_json=$(jq -n --arg name "$tagName" --arg color "$tagColor" '[{Id: null, Name: $name, Color: $color, Description: "", CanonicalTagName: null}]')
     local payload
     payload=$(jq -n --arg name "$tagsetName" --arg desc "Created by script" --argjson tags "$tags_json" '{Name: $name, Description: $desc, Tags: $tags}')
-    curl -s -S -X POST -H "X-Octopus-ApiKey: $octopusApiKey" -H "Content-Type: application/json" "$octopusUrl/api/$space_id/tagsets" -d "$payload" >/dev/null
+    curl_with_check POST "$octopusUrl/api/$space_id/tagsets" "$payload" >/dev/null
     return
   fi
 
   local current_tags
-  current_tags=$(curl -s -H "X-Octopus-ApiKey: $octopusApiKey" "$octopusUrl/api/$space_id/tagsets/$tagset_id" | jq -r '.Tags[].Name')
-  local missingTags=()
-  for tagName in "${desiredTags[@]}"; do
-    if ! contains_element_in_multiline "$tagName" "$current_tags"; then
-      missingTags+=("$tagName")
-    fi
-  done
-
-  if [ ${#missingTags[@]} -eq 0 ]; then
-    printf 'Tagset %s already contains all tenant tags\n' "$tagsetName"
+  current_tags=$(curl_with_check GET "$octopusUrl/api/$space_id/tagsets/$tagset_id" "" | jq -r '.Tags[].Name')
+  if contains_element_in_multiline "$tagName" "$current_tags"; then
+    printf 'Tagset %s already contains tag %s\n' "$tagsetName" "$tagName"
     return
   fi
 
-  printf 'Adding missing tags to tagset %s: %s\n' "$tagsetName" "${missingTags[*]}"
-  local new_tags_json
-  new_tags_json=$(printf '%s\n' "${missingTags[@]}" | jq -R . | jq -s 'map({Id: null, Name: ., Color: "", Description: "", CanonicalTagName: null})')
+  printf 'Adding tag %s to tagset %s\n' "$tagName" "$tagsetName"
+  local new_tag_json
+  new_tag_json=$(jq -n --arg name "$tagName" --arg color "$tagColor" '{Id: null, Name: $name, Color: $color, Description: "", CanonicalTagName: null}')
   local updated_payload
-  updated_payload=$(curl -s -H "X-Octopus-ApiKey: $octopusApiKey" "$octopusUrl/api/$space_id/tagsets/$tagset_id" | jq --argjson newTags "$new_tags_json" '.Tags += $newTags')
-  curl -s -S -X PUT -H "X-Octopus-ApiKey: $octopusApiKey" -H "Content-Type: application/json" "$octopusUrl/api/$space_id/tagsets/$tagset_id" -d "$updated_payload" >/dev/null
+  updated_payload=$(curl_with_check GET "$octopusUrl/api/$space_id/tagsets/$tagset_id" "" | jq --argjson newTag "$new_tag_json" '.Tags += [$newTag]')
+  curl_with_check PUT "$octopusUrl/api/$space_id/tagsets/$tagset_id" "$updated_payload" >/dev/null
 }
 
 ensure_tagsets_exist() {
-  local uniqueTagsets=()
   local fullTag
-  local tagsetName
 
   for fullTag in "${tenantTags[@]}"; do
     if [[ "$fullTag" != */* ]]; then
       echo "ERROR: tenant tag '$fullTag' must be in TagSet/Tag format" >&2
       exit 1
     fi
-    tagsetName="${fullTag%%/*}"
-    if ! contains_element "$tagsetName" "${uniqueTagsets[@]}"; then
-      uniqueTagsets+=("$tagsetName")
-    fi
-  done
-
-  for tagsetName in "${uniqueTagsets[@]}"; do
-    ensure_tagset_tags "$tagsetName"
+    ensure_tagset_tag_exists "$fullTag"
   done
 }
 
 # Get space
 printf 'Getting space %s\n' "$spaceName"
-spaces=$(curl -s -H "X-Octopus-ApiKey: $octopusApiKey" -X GET "$octopusUrl/api/spaces" -G --data-urlencode "partialName=$spaceName")
+spaces=$(curl_with_check GET "$octopusUrl/api/spaces" "" -G --data-urlencode "partialName=$spaceName")
 space_id=$(echo "$spaces" | jq -r ".Items[] | select(.Name==\"${spaceName}\") | .Id")
 if [ -z "$space_id" ] || [ "$space_id" == "null" ]; then
   echo "ERROR: space '$spaceName' not found"
@@ -203,7 +248,7 @@ fi
 
 # Get project
 printf 'Getting project %s\n' "$projectName"
-project=$(curl -s -L -X GET -H "X-Octopus-ApiKey: $octopusApiKey" "$octopusUrl/api/$space_id/projects?skip=0&take=1" -G --data-urlencode "partialName=$projectName" -H "accept: application/json")
+project=$(curl_with_check GET "$octopusUrl/api/$space_id/projects?skip=0&take=1" "" -G --data-urlencode "partialName=$projectName" -H "accept: application/json")
 project_id=$(echo "$project" | jq -r 'first(.Items[]).Id')
 if [ -z "$project_id" ] || [ "$project_id" == "null" ]; then
   echo "ERROR: project '$projectName' not found in space '$spaceName'"
@@ -217,7 +262,7 @@ fi
 
 # Get all existing tenants once so we can skip duplicate names.
 printf 'Fetching existing tenants in space %s\n' "$spaceName"
-tenants=$(curl -s -H "X-Octopus-ApiKey: $octopusApiKey" "$octopusUrl/api/$space_id/tenants/all")
+tenants=$(curl_with_check GET "$octopusUrl/api/$space_id/tenants/all" "")
 
 tenant_tags_json=$(array_to_json "${tenantTags[@]}")
 
@@ -231,7 +276,7 @@ for environmentName in "${environmentNames[@]}"; do
   fi
 
   printf 'Resolving environment %s\n' "$environmentName"
-  environment=$(curl -s -L -X GET -H "X-Octopus-ApiKey: $octopusApiKey" "$octopusUrl/api/$space_id/environments?skip=0&take=1" -G --data-urlencode "partialName=$environmentName" -H "accept: application/json" | jq 'first(.Items[])' -r)
+  environment=$(curl_with_check GET "$octopusUrl/api/$space_id/environments?skip=0&take=1" "" -G --data-urlencode "partialName=$environmentName" -H "accept: application/json" | jq 'first(.Items[])' -r)
   environment_id=$(echo "$environment" | jq -r .Id)
 
   if [ -z "$environment_id" ] || [ "$environment_id" == "null" ]; then
@@ -249,13 +294,13 @@ for environmentName in "${environmentNames[@]}"; do
     --argjson projectEnvironments "$project_environments" \
     '{Name: $name, SpaceId: $spaceId, TenantTags: $tenantTags, ProjectEnvironments: $projectEnvironments}')
 
-  response=$(curl -s -S -X POST -H "X-Octopus-ApiKey: $octopusApiKey" -H "Content-Type: application/json" "$octopusUrl/api/$space_id/tenants" -d "$tenant_payload")
+  response=$(curl_with_check POST "$octopusUrl/api/$space_id/tenants" "$tenant_payload")
   echo "Tenant creation response for '$environmentName':"
   echo "$response" | jq .
 
   if [ "$deleteEnvironments" = true ]; then
     printf 'Deleting environment %s (ID: %s)\n' "$environmentName" "$environment_id"
-    delete_response=$(curl -s -S -X DELETE -H "X-Octopus-ApiKey: $octopusApiKey" "$octopusUrl/api/$space_id/environments/$environment_id")
+    delete_response=$(curl_with_check DELETE "$octopusUrl/api/$space_id/environments/$environment_id" "")
     echo "Delete response for environment '$environmentName':"
     echo "$delete_response" | jq .
   fi
