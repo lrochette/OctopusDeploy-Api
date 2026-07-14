@@ -8,6 +8,7 @@ projectName="Parallel"
 
 # Provide target environment names; one tenant will be created per environment.
 environmentNames=("Prod-CA" "Prod-OR" "Prod-WA")
+targetEnvironment="Production"
 
 # Optional tenant tags to apply to all generated tenants.
 tenantTags=("Env/Prod" "Region/Pacific")
@@ -17,10 +18,12 @@ tagColor="#007BFF"
 
 deleteEnvironments=false
 debugMode=false
+forceMode=false
+dryRunMode=false
 
 usage() {
   cat <<'EOF'
-Usage: $(basename "$0") [-u octopusUrl] [-s spaceName] [-p projectName] [-e environmentNames] [-t tenantTags] [-d deleteEnvironments] [-h]
+Usage: $(basename "$0") [-u octopusUrl] [-s spaceName] [-p projectName] [-e environmentNames] [-te targetEnvironment] [-t tenantTags] [-d deleteEnvironments] [-h]
 
 Create one tenant for each environment listed in environmentNames.
 
@@ -30,8 +33,12 @@ Options:
   -p projectName    Override the default project name.
   -e environmentNames
                     Comma-separated list of environment names to create tenants for.
+  -te targetEnvironment
+                    Override the target environment that each created tenant is attached to.
   -t tenantTags     Comma-separated list of tenant tags to apply to each created tenant.
   -rm               Remove environments after successful tenant creation.
+  -force            Delete any existing tenant with the target name and recreate it.
+  -dryrun           Run without making any changes; skips all non-GET API calls.
   -d                Enable debug mode and print extra tracing information.
   -h                Show this help message and exit.
 EOF
@@ -48,6 +55,16 @@ curl_with_check() {
   local url="$2"
   local data="$3"
   shift 3
+
+  if [ "$dryRunMode" = true ] && [ "$method" != "GET" ]; then
+    printf 'DRYRUN: would %s %s\n' "$method" "$url" >&2
+    if [ -n "$data" ]; then
+      debug "payload: $data"
+    fi
+    printf '{"Id": "dryrun-id"}'
+    return 0
+  fi
+
   debug "curl $method $url"
 
   local response
@@ -109,6 +126,15 @@ while [ $# -gt 0 ]; do
       shift
       IFS=',' read -r -a environmentNames <<< "$1"
       ;;
+    -te)
+      if [ $# -lt 2 ]; then
+        echo "Error: -te requires an argument." >&2
+        usage
+        exit 1
+      fi
+      shift
+      targetEnvironment="$1"
+      ;;
     -t)
       if [ $# -lt 2 ]; then
         echo "Error: -t requires an argument." >&2
@@ -120,6 +146,12 @@ while [ $# -gt 0 ]; do
       ;;
     -rm)
       deleteEnvironments=true
+      ;;
+    -force)
+      forceMode=true
+      ;;
+    -dryrun)
+      dryRunMode=true
       ;;
     -d)
       debugMode=true
@@ -142,8 +174,11 @@ if [ "$debugMode" = true ]; then
   debug "spaceName=$spaceName"
   debug "projectName=$projectName"
   debug "environmentNames=${environmentNames[*]}"
+  debug "targetEnvironment=$targetEnvironment"
   debug "tenantTags=${tenantTags[*]}"
   debug "deleteEnvironments=$deleteEnvironments"
+  debug "forceMode=$forceMode"
+  debug "dryRunMode=$dryRunMode"
 fi
 
 # Utility: convert bash array to JSON array for jq.
@@ -196,7 +231,7 @@ ensure_tagset_tag_exists() {
   local encodedName
   encodedName=$(printf '%s' "$tagsetName" | jq -sRr @uri)
   local tagset_response
-  tagset_response=$(curl_with_check GET "$octopusUrl/api/$space_id/tagsets?partialName=$encodedName" "")
+  tagset_response=$(curl_with_check GET "$octopusUrl/api/$space_id/tagsets?name=$encodedName" "")
   local tagset_id
   tagset_id=$(echo "$tagset_response" | jq -r --arg name "$tagsetName" '.Items[] | select(.Name==$name) | .Id' | head -n 1)
 
@@ -239,7 +274,7 @@ ensure_tagsets_exist() {
 
 # Get space
 printf 'Getting space %s\n' "$spaceName"
-spaces=$(curl_with_check GET "$octopusUrl/api/spaces" "" -G --data-urlencode "partialName=$spaceName")
+spaces=$(curl_with_check GET "$octopusUrl/api/spaces" "" -G --data-urlencode "name=$spaceName")
 space_id=$(echo "$spaces" | jq -r ".Items[] | select(.Name==\"${spaceName}\") | .Id")
 if [ -z "$space_id" ] || [ "$space_id" == "null" ]; then
   echo "ERROR: space '$spaceName' not found"
@@ -248,7 +283,7 @@ fi
 
 # Get project
 printf 'Getting project %s\n' "$projectName"
-project=$(curl_with_check GET "$octopusUrl/api/$space_id/projects?skip=0&take=1" "" -G --data-urlencode "partialName=$projectName" -H "accept: application/json")
+project=$(curl_with_check GET "$octopusUrl/api/$space_id/projects?skip=0&take=1" "" -G --data-urlencode "name=$projectName" -H "accept: application/json")
 project_id=$(echo "$project" | jq -r 'first(.Items[]).Id')
 if [ -z "$project_id" ] || [ "$project_id" == "null" ]; then
   echo "ERROR: project '$projectName' not found in space '$spaceName'"
@@ -258,6 +293,22 @@ fi
 if [ ${#tenantTags[@]} -gt 0 ]; then
   printf 'Ensuring tenant tagsets and tags exist\n'
   ensure_tagsets_exist
+fi
+
+# Get target environment; created tenants are attached to this environment.
+printf 'Resolving target environment %s\n' "$targetEnvironment"
+target_environment=$(curl_with_check GET "$octopusUrl/api/$space_id/environments?skip=0&take=1" "" -G --data-urlencode "name=$targetEnvironment" -H "accept: application/json" | jq 'first(.Items[])' -r)
+target_environment_id=$(echo "$target_environment" | jq -r .Id)
+if [ -z "$target_environment_id" ] || [ "$target_environment_id" == "null" ]; then
+  printf 'Target environment %s not found; creating it\n' "$targetEnvironment"
+  target_environment_payload=$(jq -n --arg name "$targetEnvironment" '{Name: $name}')
+  target_environment=$(curl_with_check POST "$octopusUrl/api/$space_id/environments" "$target_environment_payload")
+  target_environment_id=$(echo "$target_environment" | jq -r .Id)
+fi
+
+if [ -z "$target_environment_id" ] || [ "$target_environment_id" == "null" ]; then
+  echo "ERROR: failed to resolve or create target environment '$targetEnvironment'"
+  exit 1
 fi
 
 # Get all existing tenants once so we can skip duplicate names.
@@ -271,12 +322,17 @@ for environmentName in "${environmentNames[@]}"; do
 
   existingTenantId=$(echo "$tenants" | jq -r --arg name "$environmentName" '.[] | select(.Name==$name) | .Id' | head -n 1)
   if [ -n "$existingTenantId" ]; then
-    echo "Skipping creation: tenant already exists with name '$environmentName' (ID: $existingTenantId)"
-    continue
+    if [ "$forceMode" != true ]; then
+      echo "Skipping creation: tenant already exists with name '$environmentName' (ID: $existingTenantId)"
+      continue
+    fi
+
+    printf 'Force mode: deleting existing tenant %s (ID: %s)\n' "$environmentName" "$existingTenantId"
+    curl_with_check DELETE "$octopusUrl/api/$space_id/tenants/$existingTenantId" "" >/dev/null
   fi
 
   printf 'Resolving environment %s\n' "$environmentName"
-  environment=$(curl_with_check GET "$octopusUrl/api/$space_id/environments?skip=0&take=1" "" -G --data-urlencode "partialName=$environmentName" -H "accept: application/json" | jq 'first(.Items[])' -r)
+  environment=$(curl_with_check GET "$octopusUrl/api/$space_id/environments?skip=0&take=1" "" -G --data-urlencode "name=$environmentName" -H "accept: application/json" | jq 'first(.Items[])' -r)
   environment_id=$(echo "$environment" | jq -r .Id)
 
   if [ -z "$environment_id" ] || [ "$environment_id" == "null" ]; then
@@ -286,7 +342,7 @@ for environmentName in "${environmentNames[@]}"; do
 
   printf 'Creating tenant for environment %s (ID: %s)\n' "$environmentName" "$environment_id"
 
-  project_environments=$(jq -n --arg projectId "$project_id" --arg environmentId "$environment_id" '{($projectId): [$environmentId]}')
+  project_environments=$(jq -n --arg projectId "$project_id" --arg environmentId "$target_environment_id" '{($projectId): ([$environmentId] | unique)}')
   tenant_payload=$(jq -n \
     --arg name "$environmentName" \
     --arg spaceId "$space_id" \
