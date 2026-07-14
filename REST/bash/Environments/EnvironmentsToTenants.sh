@@ -361,3 +361,9 @@ for environmentName in "${environmentNames[@]}"; do
     echo "$delete_response" | jq .
   fi
 done
+
+# Allow the project to be deployed tenanted or untenanted, since tenants were just added.
+printf '\nUpdating project %s to allow TenantedOrUntenanted deployments\n' "$projectName"
+project_resource=$(curl_with_check GET "$octopusUrl/api/$space_id/projects/$project_id" "")
+updated_project=$(echo "$project_resource" | jq '.TenantedDeploymentMode = "TenantedOrUntenanted"')
+curl_with_check PUT "$octopusUrl/api/$space_id/projects/$project_id" "$updated_project" >/dev/null
