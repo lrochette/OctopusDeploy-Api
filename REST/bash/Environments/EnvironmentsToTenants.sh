@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 
 # Define working variables
-octopusUrl="https://tam.octopus.app"
+octopusUrl="https://xxx.octopus.app"
 octopusApiKey=${OCTOPUS_TAM_API_KEY}
-spaceName="Applied"
-projectName="Parallel"
+spaceName="Default"
+projectName="myProject"
 
 # Provide target environment names; one tenant will be created per environment.
 environmentNames=("Prod-CA" "Prod-OR" "Prod-WA")
