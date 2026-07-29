@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 
 # Define working variables
-octopusUrl="https://xxx.octopus.app"
+octopusUrl="https://tam.octopus.app"
 octopusApiKey=${OCTOPUS_TAM_API_KEY}
-spaceName="Default"
-projectName="myProject"
+spaceName="Applied"       # Spaces-162
+projectName="Parallel"    # Projects-481
+gitRef=''
 
 # Provide target environment names; one tenant will be created per environment.
-environmentNames=("Prod-CA" "Prod-OR" "Prod-WA")
-targetEnvironment="Production"
+environmentNames=("Dev-AL" "Dev-AK")
+targetEnvironment="Development"
 
 # Optional tenant tags to apply to all generated tenants.
-tenantTags=("Env/Prod" "Region/Pacific")
+tenantTags=("Env/Dev" "Region/South")
 
 # Tag color used when creating missing tags.
 tagColor="#007BFF"
@@ -36,6 +37,7 @@ Options:
   -te targetEnvironment
                     Override the target environment that each created tenant is attached to.
   -t tenantTags     Comma-separated list of tenant tags to apply to each created tenant.
+  -g gitRef         Indicate the git ref used for projects under source control.
   -rm               Remove environments after successful tenant creation.
   -force            Delete any existing tenant with the target name and recreate it.
   -dryrun           Run without making any changes; skips all non-GET API calls.
@@ -144,6 +146,15 @@ while [ $# -gt 0 ]; do
       shift
       IFS=',' read -r -a tenantTags <<< "$1"
       ;;
+    -g)
+      if [ $# -lt 2 ]; then
+        echo "Error: -g requires an argument." >&2
+        usage
+        exit 1
+      fi
+      shift
+      gitRef="$1/"
+      ;;
     -rm)
       deleteEnvironments=true
       ;;
@@ -176,6 +187,7 @@ if [ "$debugMode" = true ]; then
   debug "environmentNames=${environmentNames[*]}"
   debug "targetEnvironment=$targetEnvironment"
   debug "tenantTags=${tenantTags[*]}"
+  debug "gitRef=$gitRef"
   debug "deleteEnvironments=$deleteEnvironments"
   debug "forceMode=$forceMode"
   debug "dryRunMode=$dryRunMode"
@@ -284,9 +296,17 @@ fi
 # Get project
 printf 'Getting project %s\n' "$projectName"
 project=$(curl_with_check GET "$octopusUrl/api/$space_id/projects?skip=0&take=1" "" -G --data-urlencode "name=$projectName" -H "accept: application/json")
+
 project_id=$(echo "$project" | jq -r 'first(.Items[]).Id')
 if [ -z "$project_id" ] || [ "$project_id" == "null" ]; then
   echo "ERROR: project '$projectName' not found in space '$spaceName'"
+  exit 1
+fi
+
+versionControlled=$(echo "$project" | jq -r 'first(.Items[]).IsVersionControlled')
+if [ "$versionControlled" == "true" ] && [ "$gitRef" == "" ]; then
+  echo "ERROR: project '$projectName' is under Source Control"
+  echo "       please specify the git ref using -g <gitRef> (e.g., -g main)"
   exit 1
 fi
 
@@ -294,6 +314,15 @@ if [ ${#tenantTags[@]} -gt 0 ]; then
   printf 'Ensuring tenant tagsets and tags exist\n'
   ensure_tagsets_exist
 fi
+
+# Fetch all project variables once; scoping is updated in memory as each tenant is created
+# and written back after the loop.
+printf 'Fetching variables for project %s\n' "$projectName"
+variable_set=$(curl_with_check GET "$octopusUrl/api/$space_id/projects/$project_id/${gitRef}variables" "" -H "accept: application/json")
+#
+# XX remove
+#
+echo "$variable_set" | jq .Variables
 
 # Get target environment; created tenants are attached to this environment.
 printf 'Resolving target environment %s\n' "$targetEnvironment"
@@ -315,7 +344,8 @@ fi
 printf 'Fetching existing tenants in space %s\n' "$spaceName"
 tenants=$(curl_with_check GET "$octopusUrl/api/$space_id/tenants/all" "")
 
-tenant_tags_json=$(array_to_json "${tenantTags[@]}")
+#tenant_tags_json=$(array_to_json "${tenantTags[@]}")
+tenant_tags_json=$(printf '%s\n' "${tenantTags[@]}" | jq -R . | jq -s 'map(@json) |   join(",") ')
 
 for environmentName in "${environmentNames[@]}"; do
   printf '\nProcessing environment: %s\n' "$environmentName"
@@ -354,6 +384,26 @@ for environmentName in "${environmentNames[@]}"; do
   echo "Tenant creation response for '$environmentName':"
   echo "$response" | jq .
 
+  tenant_id=$(echo "$response" | jq -r '.Id // empty')
+  if [ -n "$tenant_id" ]; then
+    printf 'Rescoping project variables from environment %s (ID: %s) to environment %s (ID: %s)\n' "$environmentName" "$environment_id" "$targetEnvironment" $target_environment_id
+    variable_set=$(echo "$variable_set" | jq \
+      --arg envId "$environment_id" \
+      --arg targetEnvId "$target_environment_id" \
+      --arg tenantTags "$tenantTags" \
+      '.Variables |= map(
+        if ((.Scope.Environment // []) | index($envId)) then
+          .Scope.Environment = (((.Scope.Environment // []) - [$envId]) + [$targetEnvId] | unique)
+          | .Scope.TenantTag = (((.Scope.TenantTag // []) + [$tenantTags]) | unique)
+        else
+          .
+        end
+      )')
+  fi
+  #       --arg tenantId "$tenant_id" \
+  #  | .Scope.Tenant = (((.Scope.Tenant // []) + [$tenantId]) | unique)
+  debug "variable set: $variable_set"
+  
   if [ "$deleteEnvironments" = true ]; then
     printf 'Deleting environment %s (ID: %s)\n' "$environmentName" "$environment_id"
     delete_response=$(curl_with_check DELETE "$octopusUrl/api/$space_id/environments/$environment_id" "")
@@ -361,6 +411,10 @@ for environmentName in "${environmentNames[@]}"; do
     echo "$delete_response" | jq .
   fi
 done
+
+# Persist the rescoped project variables (environment -> target environment + tenant).
+printf '\nUpdating project variables with new environment/tenant scoping\n'
+curl_with_check PUT "$octopusUrl/api/$space_id/projects/$project_id/${gitRef}variables" "$variable_set" >/dev/null
 
 # Allow the project to be deployed tenanted or untenanted, since tenants were just added.
 printf '\nUpdating project %s to allow TenantedOrUntenanted deployments\n' "$projectName"
